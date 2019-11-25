@@ -1,0 +1,251 @@
+# Deployment for Debian on VirtualBox
+# VM's Network: Adapter 1 : Bridged Adaptater, Adapter 2 : Host-only Adapter IPv4=192.168.99.1
+# User : root
+# Password : toor
+# User : yohan
+# Password : pwd
+# Static IP : 192.168.99.2
+
+
+# Lors de l'installation créer 3 partitions
+# 1 de 2.6Go pour ext4 /
+# 2 de 1Go pour SWAPS
+# 3 du reste pour ext4 /home
+
+::::::::::
+:: Sudo ::
+::::::::::
+
+su
+export PATH=$PATH:/usr/sbin/
+echo 'export PATH=$PATH:/usr/sbin/' ' >> ~/.bashrc
+echo 'export PATH=$PATH:/usr/sbin/' >> /home/yohan/.bashrc
+apt update && apt upgrade -y && apt install -y vim sudo ufw fail2ban nginx
+select-editor # -- need to choose [2](vim)
+
+
+# Hint to add new sudo user:
+visudo /etc/sudoers
+yohan	ALL=(ALL:ALL) NOPASSWD:ALL
+
+
+:::::::::::::::
+:: Static IP ::
+:::::::::::::::
+
+ip a l # -- list all available intefaces of our VM
+vim /etc/network/interfaces # and add :
+'
+auto enp0s3
+iface enp0s3 inet dhcp
+
+auto enp0s8
+iface enp0s8 inet static
+	address 192.168.99.2
+	netmask 255.255.255.252 #netmask /30
+'
+
+systemctl restart networking
+ip a l # -- check out that the config for our main network device `enp0s3` + `enp0s8` has changed
+
+
+:::::::::	
+:: SSH ::
+:::::::::
+
+# --- In host machine --- #
+ssh-keygen # -- generate private and public keys to ~/.ssh/id_rsa and ~/.ssh/id_rsa.pub folders respectively
+ssh-copy-id -i ~/.ssh/id_rsa.pub yohan@192.168.99.2
+# -- Now you can `ssh yohan@192.168.99.2` on your host machine ...
+
+vim /etc/ssh/sshd_config # -- Go to the ssh config and replace lines:
+# -- # Port `22` ==> `2222`
+# -- # PermitRootLogin `prohibit-password` ==> `no`
+# -- # PasswordAuthentification `yes` ==> `no`
+# -- # PubkeyAuthentification `no` ==> `yes`
+
+systemctl restart sshd # -- to apply new configuration
+systemctl status sshd # -- check out, that changes have applied, by find out line `listening on :: port 2222`
+sudo reboot
+
+#! Clone de la machine si ça plante au niveau des protections 
+
+# Enter from Host machine on VM
+ssh -p 2222 yohan@192.168.99.2
+
+
+::::::::::::::
+:: Firewall ::
+::::::::::::::
+
+#https://wiki.debian.org/iptables
+
+ufw status
+ufw enable
+
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 2222/tcp
+ufw allow https
+ufw allow http
+ufw allow dns
+ufw reload
+
+
+::::::::::::::::::::::::::
+:: DDOS/Scan protection ::
+::::::::::::::::::::::::::
+
+#http://viruslocker.free.fr/?page_id=728
+
+vim /etc/fail2ban/jail.local
+
+'
+[sshd]
+enabled = true
+port = 2222
+filter = sshd
+bantime = 1m
+findtime = 1m
+maxretry = 3
+
+[portscan]
+enabled = true
+filter = portscan
+logpath = /var/log/syslog
+bantime = 1m
+findtime = 1m
+maxretry = 1
+
+'
+
+systemctl restart fail2ban
+fail2ban-client status sshd
+unban fail2ban-client set sshd unbanip aa.bb.cc.dd
+
+
+::::::::::::::
+:: Services ::
+::::::::::::::
+
+`systemctl list-unit-files | grep enabled`
+`sudo systemctl disable XXXXXXX`
+
+autovt@.service 	#Necessary for using virtual terminals
+console-setup.service 	#Configuration for the console
+cron.service 		#Scheduled tasks
+fail2ban.service 	#Protection against DOS
+getty@.service 		#Necessary for login
+keyboard-setup.service 	#Configuration for the keyboard
+networking.service 	#Network
+ssh.service 		#Needed for SSH connection
+sshd.service 		#Needed for SSH connection
+ufw.service 		#Needed for firewall
+
+Everything else disabled
+
+
+::::::::::::
+:: Script ::
+::::::::::::
+
+
+Script to update Debian + log
+
+'
+sudo apt-get update -y >> /var/log/update_script.log
+sudo apt-get upgrade -y >> /var/log/update_script.log
+
+'
+
+
+Script to check if root crontab have been modified + log
+'
+#!/bin/bash
+
+FILE="/var/tmp/checksum"
+FILE_TO_WATCH="/var/spool/cron/crontabs/root"
+MD5VALUE=$(sudo md5sum $FILE_TO_WATCH | awk '{ print $1 }')
+
+if [ ! -f $FILE ]; then
+	 echo "$MD5VALUE" > $FILE
+	 exit 0;
+fi;
+
+if [ "$MD5VALUE" != "$(cat $FILE)" ]; then
+	echo "$MD5VALUE" > $FILE
+	echo "$FILE_TO_WATCH has been modified !" && echo "$FILE_TO_WATCH modified !" | sudo mail root
+else
+	echo "$FILE_TO_WATCH not modified !" && echo "$FILE_TO_WATCH NOT modified !" | sudo mail root
+fi;
+
+'
+
+# Les mails se trouvent dans /var/mail/[user]
+sudo vim /etc/aliases # changer à qui les mails root son redirigé
+
+sudo chmod +x /home/yohan/*.sh
+
+sudo crontab -e
+
+0 4 * * MON	/home/yohan/./update_script.sh >> /var/log/update_script.log
+@reboot		/home/yohan/./update_script.sh >> /var/log/update_script.log
+0 0 * * * 	/home/yohan/./check_cron.sh >> /var/log/checkcron_script.log
+
+
+:::::::::
+:: Web ::
+::::::::: 
+
+apt-get install nginx
+
+vim /var/www/html/roger.html
+'
+<html>
+    <head>
+        <title>Roger-Skyline Ythollet</title>
+    </head>
+    <body>
+        <h1>Server is working</h1>
+    </body>
+</html>
+
+'
+
+mkdir /etc/nginx/ssl
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -subj "/CN=192.168.99.2" -keyout /etc/nginx/ssl/nginx.key -out /etc/nginx/ssl/nginx.crt
+
+vim /etc/nginx/sites-available/default
+'
+server {
+    server_name 192.168.99.2;
+    listen       80  default_server;
+    return       500;
+}
+
+
+server {
+    listen 443 ssl;
+    server_name 192.168.99.2 ;
+    ssl_certificate /etc/nginx/ssl/nginx.crt;
+    ssl_certificate_key /etc/nginx/ssl/nginx.key;
+    root /var/www/html;
+
+    # Add index.php to the list if you are using PHP
+    index roger.html;
+
+    server_name _;
+
+    location / {
+	# First attempt to serve request as file, then
+	# as directory, then fall back to displaying a 404.
+	try_files $uri $uri/ =404;
+    }
+}
+
+'
+nginx -t #pour vérifier que la config nginx est good
+systemctl restart nginx
+
+cat /etc/nginx/ssl/nginx.key /etc/nginx/ssl/nginx.crt > /etc/nginx/ssl/nginx.pem
+curl --cacert /etc/nginx/ssl/nginx.pem https://192.168.99.2
